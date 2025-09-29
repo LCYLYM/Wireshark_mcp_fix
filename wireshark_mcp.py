@@ -8,18 +8,10 @@ import sys
 import signal
 import platform
 from typing import Dict, List, Optional, Union
-import uvicorn
-from starlette.applications import Starlette
-from starlette.routing import Mount, Route
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
-from starlette.requests import Request
-from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
 from datetime import datetime
+from collections import Counter
 
-from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
-from mcp.types import Tool
 
 # 自定义日志格式
 class CustomFormatter(logging.Formatter):
@@ -64,9 +56,63 @@ class WiresharkMCP:
         Args:
             tshark_path: tshark 可执行文件的路径
         """
-        self.tshark_path = tshark_path
+        # 验证 tshark_path 参数
+        if not isinstance(tshark_path, str) or not tshark_path.strip():
+            raise ValueError("tshark_path 必须是非空字符串")
+            
+        self.tshark_path = tshark_path.strip()
         self._verify_tshark()
         self.running = True
+        
+    def _validate_file_path(self, file_path: str) -> None:
+        """验证文件路径的安全性和有效性"""
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise ValueError("文件路径不能为空")
+            
+        file_path = file_path.strip()
+        
+        # 防止路径遍历攻击
+        if ".." in file_path or file_path.startswith("/"):
+            # 允许绝对路径，但禁止路径遍历
+            if ".." in file_path:
+                raise ValueError("文件路径不能包含 '..' 序列")
+        
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"找不到文件: {file_path}")
+            
+        if not os.access(file_path, os.R_OK):
+            raise PermissionError(f"无法读取文件: {file_path}")
+    
+    def _validate_max_packets(self, max_packets: int) -> int:
+        """验证和标准化 max_packets 参数"""
+        if not isinstance(max_packets, int):
+            try:
+                max_packets = int(max_packets)
+            except (ValueError, TypeError):
+                raise ValueError("max_packets 必须是整数")
+        
+        if max_packets <= 0:
+            raise ValueError("max_packets 必须大于 0")
+            
+        if max_packets > 50000:  # 防止过大的值导致系统问题
+            logger.warning(f"max_packets 值 {max_packets} 过大，已限制为 50000")
+            max_packets = 50000
+            
+        return max_packets
+    
+    def _validate_filter_expression(self, filter_expr: str) -> str:
+        """验证过滤器表达式的基本安全性"""
+        if not isinstance(filter_expr, str):
+            raise ValueError("过滤器表达式必须是字符串")
+            
+        filter_expr = filter_expr.strip()
+        
+        # 基本的安全检查，防止命令注入
+        dangerous_chars = [";", "&", "|", "`", "$", "()", "{}"]
+        if any(char in filter_expr for char in dangerous_chars):
+            logger.warning(f"过滤器表达式包含可能危险的字符: {filter_expr}")
+            
+        return filter_expr
         
     def _verify_tshark(self):
         """验证 tshark 是否可用"""
@@ -213,9 +259,31 @@ class WiresharkMCP:
             filter: 抓包过滤器表达式
             max_packets: 最大数据包数量
         """
+        # 验证参数
+        if not isinstance(interface, str) or not interface.strip():
+            return json.dumps({
+                "status": "error",
+                "error": {"type": "invalid_parameter", "message": "网络接口名称不能为空"}
+            }, ensure_ascii=False, indent=2)
+            
+        if not isinstance(duration, int) or duration <= 0 or duration > 3600:
+            return json.dumps({
+                "status": "error", 
+                "error": {"type": "invalid_parameter", "message": "持续时间必须是 1-3600 秒之间的整数"}
+            }, ensure_ascii=False, indent=2)
+            
+        try:
+            max_packets = self._validate_max_packets(max_packets)
+            filter = self._validate_filter_expression(filter)
+        except ValueError as e:
+            return json.dumps({
+                "status": "error",
+                "error": {"type": "invalid_parameter", "message": str(e)}
+            }, ensure_ascii=False, indent=2)
+        
         cmd = [
             self.tshark_path,
-            "-i", interface,
+            "-i", interface.strip(),
             "-a", f"duration:{duration}",
             "-T", "json",
             "-c", str(max_packets)
@@ -236,14 +304,28 @@ class WiresharkMCP:
             interfaces = []
             for line in proc.stdout.splitlines():
                 if line.strip():
-                    parts = line.split(".", 1)[1].strip().split("[", 1)
-                    iface = parts[0].strip()
-                    desc = parts[1].rstrip("]").strip() if len(parts) > 1 else ""
-                    interfaces.append({"name": iface, "description": desc})
+                    # Parse tshark -D output format: "1. interface_name [description]"
+                    # or "1. interface_name"
+                    if ". " in line:
+                        # Remove the number prefix
+                        interface_part = line.split(". ", 1)[1].strip()
+                        if "[" in interface_part and interface_part.endswith("]"):
+                            # Has description
+                            parts = interface_part.rsplit(" [", 1)
+                            iface = parts[0].strip()
+                            desc = parts[1].rstrip("]").strip()
+                        else:
+                            # No description
+                            iface = interface_part.strip()
+                            desc = ""
+                        interfaces.append({"name": iface, "description": desc})
             return interfaces
         except subprocess.CalledProcessError as e:
             logger.error(f"获取接口列表失败: {e}")
-            raise
+            return []
+        except Exception as e:
+            logger.error(f"解析接口列表时出错: {e}")
+            return []
 
     def analyze_pcap(self, 
                     file_path: str,
@@ -256,8 +338,22 @@ class WiresharkMCP:
             filter: 显示过滤器表达式
             max_packets: 最大数据包数量
         """
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"找不到文件: {file_path}")
+        try:
+            self._validate_file_path(file_path)
+            max_packets = self._validate_max_packets(max_packets)
+            filter = self._validate_filter_expression(filter)
+        except (ValueError, FileNotFoundError, PermissionError) as e:
+            return json.dumps({
+                "status": "error",
+                "metadata": {
+                    "timestamp": datetime.now().isoformat(),
+                    "file_path": file_path
+                },
+                "error": {
+                    "type": "validation_error",
+                    "message": str(e)
+                }
+            }, ensure_ascii=False, indent=2)
             
         cmd = [
             self.tshark_path,
@@ -273,7 +369,22 @@ class WiresharkMCP:
     def get_protocols(self) -> List[str]:
         """获取支持的协议列表"""
         cmd = [self.tshark_path, "-G", "protocols"]
-        return self._run_tshark_command(cmd).splitlines()
+        try:
+            proc = subprocess.run(cmd,
+                                capture_output=True,
+                                text=True,
+                                check=True)
+            protocols = []
+            for line in proc.stdout.splitlines():
+                if line.strip():
+                    # Parse protocol format: "protocol_name	protocol_description"
+                    parts = line.split('\t')
+                    if len(parts) >= 2:
+                        protocols.append(parts[0].strip())
+            return protocols
+        except subprocess.CalledProcessError as e:
+            logger.error(f"获取协议列表失败: {e}")
+            return []
 
     def get_packet_statistics(self, 
                             file_path: str,
@@ -284,6 +395,19 @@ class WiresharkMCP:
             file_path: pcap 文件路径
             filter: 显示过滤器表达式
         """
+        if not os.path.exists(file_path):
+            return json.dumps({
+                "status": "error",
+                "metadata": {
+                    "timestamp": datetime.now().isoformat(),
+                    "file_path": file_path
+                },
+                "error": {
+                    "type": "file_not_found",
+                    "message": f"找不到文件: {file_path}"
+                }
+            }, ensure_ascii=False, indent=2)
+            
         cmd = [
             self.tshark_path,
             "-r", file_path,
@@ -295,7 +419,44 @@ class WiresharkMCP:
         if filter:
             cmd.extend(["-Y", filter])
             
-        return self._run_tshark_command(cmd)
+        try:
+            proc = subprocess.run(cmd,
+                                capture_output=True,
+                                text=True,
+                                check=True)
+            
+            # Format the statistics output as structured JSON
+            stats_lines = proc.stdout.strip().split('\n')
+            return json.dumps({
+                "status": "success",
+                "metadata": {
+                    "timestamp": datetime.now().isoformat(),
+                    "file_path": file_path,
+                    "filter": filter,
+                    "tshark_version": self._get_tshark_version()
+                },
+                "statistics": {
+                    "raw_output": stats_lines,
+                    "summary": "数据包统计信息已生成"
+                }
+            }, ensure_ascii=False, indent=2)
+            
+        except subprocess.CalledProcessError as e:
+            error_msg = f"tshark 统计命令执行失败: {e.stderr if e.stderr else str(e)}"
+            logger.error(error_msg)
+            return json.dumps({
+                "status": "error",
+                "metadata": {
+                    "timestamp": datetime.now().isoformat(),
+                    "file_path": file_path,
+                    "filter": filter
+                },
+                "error": {
+                    "type": "tshark_command_failed",
+                    "message": error_msg,
+                    "command": " ".join(cmd)
+                }
+            }, ensure_ascii=False, indent=2)
 
     def extract_fields(self,
                       file_path: str,
@@ -416,8 +577,16 @@ class WiresharkMCP:
         """
         if not os.path.exists(file_path):
             return json.dumps({
-                "error": f"找不到文件: {file_path}",
-                "建议": "请检查文件路径是否正确"
+                "status": "error",
+                "metadata": {
+                    "timestamp": datetime.now().isoformat(),
+                    "file_path": file_path
+                },
+                "error": {
+                    "type": "file_not_found",
+                    "message": f"找不到文件: {file_path}",
+                    "suggestion": "请检查文件路径是否正确"
+                }
             }, ensure_ascii=False, indent=2)
             
         cmd = [
@@ -428,25 +597,11 @@ class WiresharkMCP:
         ]
         
         if protocol:
-            # 直接使用协议名称作为过滤器，不添加 $ 符号
+            # 直接使用协议名称作为过滤器
             cmd.extend(["-Y", protocol.lower()])
             
-        result = self._run_tshark_command(cmd, max_packets)
-        
-        # 解析结果并添加统计信息
-        try:
-            data = json.loads(result)
-            if isinstance(data, list):
-                stats = {
-                    "协议": protocol if protocol else "all",
-                    "总数据包数": len(data),
-                    "数据包详情": data
-                }
-                return json.dumps(stats, ensure_ascii=False, indent=2)
-        except json.JSONDecodeError:
-            pass
-            
-        return result
+        # _run_tshark_command already returns formatted JSON with metadata
+        return self._run_tshark_command(cmd, max_packets)
 
     def analyze_errors(self,
                       file_path: str,
@@ -461,8 +616,16 @@ class WiresharkMCP:
         """
         if not os.path.exists(file_path):
             return json.dumps({
-                "error": f"找不到文件: {file_path}",
-                "建议": "请检查文件路径是否正确"
+                "status": "error",
+                "metadata": {
+                    "timestamp": datetime.now().isoformat(),
+                    "file_path": file_path
+                },
+                "error": {
+                    "type": "file_not_found",
+                    "message": f"找不到文件: {file_path}",
+                    "suggestion": "请检查文件路径是否正确"
+                }
             }, ensure_ascii=False, indent=2)
         
         # 根据错误类型设置过滤器
@@ -485,23 +648,8 @@ class WiresharkMCP:
             "-c", str(max_packets)
         ]
         
-        result = self._run_tshark_command(cmd, max_packets)
-        
-        # 如果是 JSON 字符串，解析并添加统计信息
-        try:
-            data = json.loads(result)
-            if isinstance(data, list):
-                stats = {
-                    "总错误包数": len(data),
-                    "错误类型": error_type,
-                    "过滤器表达式": filter_expr,
-                    "数据包详情": data
-                }
-                return json.dumps(stats, ensure_ascii=False, indent=2)
-        except json.JSONDecodeError:
-            pass
-        
-        return result
+        # _run_tshark_command already returns formatted JSON with metadata
+        return self._run_tshark_command(cmd, max_packets)
 
     def stop(self):
         """停止服务器"""
@@ -510,8 +658,10 @@ class WiresharkMCP:
 def create_mcp_server(wireshark: WiresharkMCP) -> FastMCP:
     """创建 MCP 服务器实例"""
     mcp = FastMCP(
-        "Wireshark MCP",
-        server_url="http://127.0.0.1:3000"
+        name="Wireshark MCP",
+        instructions="A Model Context Protocol server for Wireshark/tshark integration that provides network packet analysis capabilities.",
+        host="127.0.0.1",
+        port=3000
     )
     
     # 存储服务器实例
@@ -520,7 +670,11 @@ def create_mcp_server(wireshark: WiresharkMCP) -> FastMCP:
     
     @mcp.tool()
     def list_interfaces() -> List[Dict[str, str]]:
-        """列出所有可用的网络接口"""
+        """列出所有可用的网络接口
+        
+        Returns:
+            包含接口名称和描述的字典列表，每个字典包含 'name' 和 'description' 键
+        """
         return wireshark.list_interfaces()
             
     @mcp.tool()
@@ -528,25 +682,56 @@ def create_mcp_server(wireshark: WiresharkMCP) -> FastMCP:
                     duration: int = 10,
                     filter: str = "",
                     max_packets: int = 100) -> str:
-        """实时抓包分析"""
+        """在指定网络接口上执行实时数据包捕获和分析
+        
+        Args:
+            interface: 网络接口名称 (使用 list_interfaces 获取可用接口)
+            duration: 捕获持续时间，单位秒 (默认: 10)
+            filter: BPF 过滤器表达式 (例如: "tcp port 80")
+            max_packets: 最大捕获数据包数量 (默认: 100)
+            
+        Returns:
+            JSON 格式的捕获结果，包含数据包详细信息和元数据
+        """
         return wireshark.capture_live(interface, duration, filter, max_packets)
             
     @mcp.tool()
     def analyze_pcap(file_path: str,
                     filter: str = "",
                     max_packets: int = 100) -> str:
-        """分析 pcap 文件"""
+        """分析现有的 pcap/pcapng 文件
+        
+        Args:
+            file_path: pcap 或 pcapng 文件的完整路径
+            filter: Wireshark 显示过滤器表达式 (例如: "ip.addr == 192.168.1.1")
+            max_packets: 要分析的最大数据包数量 (默认: 100)
+            
+        Returns:
+            JSON 格式的分析结果，包含数据包详细信息、统计信息和元数据
+        """
         return wireshark.analyze_pcap(file_path, filter, max_packets)
 
     @mcp.tool()
     def get_protocols() -> List[str]:
-        """获取支持的协议列表"""
+        """获取 tshark 支持的所有协议列表
+        
+        Returns:
+            协议名称字符串列表，可用于过滤器表达式
+        """
         return wireshark.get_protocols()
 
     @mcp.tool()
     def get_packet_statistics(file_path: str,
                             filter: str = "") -> str:
-        """获取数据包统计信息"""
+        """获取 pcap 文件的详细统计信息
+        
+        Args:
+            file_path: pcap 或 pcapng 文件的完整路径
+            filter: 可选的显示过滤器表达式
+            
+        Returns:
+            JSON 格式的统计信息，包含 I/O 统计、会话统计和端点统计
+        """
         return wireshark.get_packet_statistics(file_path, filter)
 
     @mcp.tool()
@@ -554,27 +739,54 @@ def create_mcp_server(wireshark: WiresharkMCP) -> FastMCP:
                       fields: List[str],
                       filter: str = "",
                       max_packets: int = 5000) -> str:
-        """提取特定字段信息"""
+        """从数据包中提取特定字段并进行统计分析
+        
+        Args:
+            file_path: pcap 或 pcapng 文件的完整路径
+            fields: 要提取的字段名称列表 (例如: ["ip.src", "ip.dst", "tcp.port"])
+            filter: 可选的显示过滤器表达式
+            max_packets: 要分析的最大数据包数量 (默认: 5000)
+            
+        Returns:
+            JSON 格式的字段统计结果，包含出现频率、排行榜等分析数据
+        """
         return wireshark.extract_fields(file_path, fields, filter, max_packets)
 
     @mcp.tool()
     def analyze_protocols(file_path: str,
                         protocol: str = "",
                         max_packets: int = 100) -> str:
-        """分析特定协议的数据包"""
+        """分析特定协议的数据包
+        
+        Args:
+            file_path: pcap 或 pcapng 文件的完整路径
+            protocol: 协议名称 (例如: "http", "tcp", "dns")，留空分析所有协议
+            max_packets: 要分析的最大数据包数量 (默认: 100)
+            
+        Returns:
+            JSON 格式的协议分析结果，包含协议相关的数据包详情和统计信息
+        """
         return wireshark.analyze_protocols(file_path, protocol, max_packets)
         
     @mcp.tool()
     def analyze_errors(file_path: str,
                       error_type: str = "all",
                       max_packets: int = 5000) -> str:
-        """分析数据包中的错误"""
+        """分析数据包中的各种错误和异常情况
+        
+        Args:
+            file_path: pcap 或 pcapng 文件的完整路径
+            error_type: 错误类型 - "all" (所有错误), "malformed" (格式错误), 
+                       "tcp" (TCP分析错误), "retransmission" (重传), 
+                       "duplicate_ack" (重复ACK), "lost_segment" (丢失段)
+            max_packets: 要分析的最大数据包数量 (默认: 5000)
+            
+        Returns:
+            JSON 格式的错误分析结果，包含错误数据包的详细信息和分类统计
+        """
         return wireshark.analyze_errors(file_path, error_type, max_packets)
     
     return mcp
-
-# 全局变量存储服务器实例
-server_instance = None
 
 def cleanup():
     """清理资源"""
@@ -582,277 +794,16 @@ def cleanup():
         if hasattr(create_mcp_server, 'wireshark'):
             create_mcp_server.wireshark.stop()
         if hasattr(create_mcp_server, 'instance'):
-            create_mcp_server.instance.shutdown()
+            # FastMCP cleanup will be handled automatically
+            pass
     except Exception as e:
-        # 仅在调试级别记录清理错误
         logger.debug(f"清理资源时发生错误: {e}")
 
 def handle_exit(signum, frame):
     """处理退出信号"""
-    global server_instance
-    
-    # 设置更低的日志级别，减少退出时的错误信息
-    logging.getLogger("uvicorn").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
-    
-    try:
-        logger.info("正在关闭服务器...")
-        cleanup()
-        
-        # 如果服务器实例存在，尝试停止它
-        if server_instance:
-            server_instance.should_exit = True
-            
-    except Exception as e:
-        # 仅在调试级别记录退出错误
-        logger.debug(f"退出时发生错误: {e}")
-    finally:
-        # 使用 os._exit 确保程序立即退出
-        os._exit(0)
-
-def homepage(request: Request) -> HTMLResponse:
-    """根路由处理器"""
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Wireshark MCP 服务器</title>
-        <style>
-            :root {
-                --primary-color: #1976d2;
-                --success-color: #2e7d32;
-                --background-color: #f5f5f5;
-                --card-background: white;
-                --text-color: #333;
-                --border-color: #ddd;
-            }
-            
-            body { 
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                margin: 0;
-                padding: 0;
-                background: var(--background-color);
-                color: var(--text-color);
-                line-height: 1.6;
-            }
-            
-            .container { 
-                max-width: 1000px; 
-                margin: 40px auto;
-                padding: 30px;
-                background: var(--card-background);
-                border-radius: 12px;
-                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            }
-            
-            .header {
-                margin-bottom: 30px;
-                padding-bottom: 20px;
-                border-bottom: 2px solid var(--border-color);
-            }
-            
-            .header h1 {
-                color: var(--primary-color);
-                margin: 0;
-                font-size: 2.2em;
-            }
-            
-            .status {
-                padding: 20px;
-                background: #e8f5e9;
-                border-radius: 8px;
-                margin: 20px 0;
-                color: var(--success-color);
-                display: flex;
-                align-items: center;
-                gap: 10px;
-            }
-            
-            .status::before {
-                content: "●";
-                color: var(--success-color);
-                font-size: 1.5em;
-            }
-            
-            .tools-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-                gap: 20px;
-                margin: 30px 0;
-            }
-            
-            .tool { 
-                padding: 20px;
-                background: white;
-                border: 1px solid var(--border-color);
-                border-radius: 8px;
-                transition: all 0.3s ease;
-            }
-            
-            .tool:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-            }
-            
-            .tool h3 { 
-                margin: 0 0 10px 0;
-                color: var(--primary-color);
-                font-size: 1.2em;
-            }
-            
-            .tool p {
-                margin: 0;
-                color: #666;
-                font-size: 0.95em;
-            }
-            
-            .tool .params {
-                margin-top: 10px;
-                font-size: 0.9em;
-                color: #888;
-            }
-            
-            .info-section {
-                margin-top: 40px;
-                padding-top: 20px;
-                border-top: 2px solid var(--border-color);
-            }
-            
-            .info-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                gap: 20px;
-                margin-top: 20px;
-            }
-            
-            .info-card {
-                padding: 15px;
-                background: #f8f9fa;
-                border-radius: 6px;
-                border-left: 4px solid var(--primary-color);
-            }
-            
-            .info-card h4 {
-                margin: 0 0 10px 0;
-                color: var(--primary-color);
-            }
-            
-            .info-card p {
-                margin: 0;
-                font-size: 0.9em;
-                color: #666;
-            }
-            
-            @media (max-width: 768px) {
-                .container {
-                    margin: 20px;
-                    padding: 20px;
-                }
-                
-                .tools-grid {
-                    grid-template-columns: 1fr;
-                }
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>Wireshark MCP 服务器</h1>
-            </div>
-            
-            <div class="status">
-                服务器运行正常
-            </div>
-            
-            <h2>可用工具</h2>
-            <div class="tools-grid">
-                <div class="tool">
-                    <h3>list_interfaces</h3>
-                    <p>列出所有可用的网络接口</p>
-                    <div class="params">返回类型: List[Dict[str, str]]</div>
-                </div>
-                
-                <div class="tool">
-                    <h3>capture_live</h3>
-                    <p>实时抓包分析</p>
-                    <div class="params">参数: interface, duration, filter, max_packets</div>
-                </div>
-                
-                <div class="tool">
-                    <h3>analyze_pcap</h3>
-                    <p>分析 pcap 文件内容</p>
-                    <div class="params">参数: file_path, filter, max_packets</div>
-                </div>
-                
-                <div class="tool">
-                    <h3>get_protocols</h3>
-                    <p>获取支持的协议列表</p>
-                    <div class="params">返回类型: List[str]</div>
-                </div>
-                
-                <div class="tool">
-                    <h3>get_packet_statistics</h3>
-                    <p>获取数据包统计信息</p>
-                    <div class="params">参数: file_path, filter</div>
-                </div>
-                
-                <div class="tool">
-                    <h3>extract_fields</h3>
-                    <p>提取数据包中的特定字段</p>
-                    <div class="params">参数: file_path, fields, filter, max_packets</div>
-                </div>
-                
-                <div class="tool">
-                    <h3>analyze_protocols</h3>
-                    <p>分析特定协议的数据包</p>
-                    <div class="params">参数: file_path, protocol, max_packets</div>
-                </div>
-                
-                <div class="tool">
-                    <h3>analyze_errors</h3>
-                    <p>分析数据包中的错误</p>
-                    <div class="params">参数: file_path, error_type, max_packets</div>
-                </div>
-            </div>
-            
-            <div class="info-section">
-                <h2>系统信息</h2>
-                <div class="info-grid">
-                    <div class="info-card">
-                        <h4>服务器配置</h4>
-                        <p>端口: 3000</p>
-                        <p>地址: http://127.0.0.1:3000</p>
-                    </div>
-                    
-                    <div class="info-card">
-                        <h4>数据限制</h4>
-                        <p>默认最大数据包数: 5000</p>
-                        <p>支持过滤器表达式</p>
-                    </div>
-                    
-                    <div class="info-card">
-                        <h4>LLM 分析</h4>
-                        <p>已配置为中文回复</p>
-                        <p>支持智能分析和数据统计</p>
-                    </div>
-                    
-                    <div class="info-card">
-                        <h4>帮助信息</h4>
-                        <p>查看 tshark 文档获取更多过滤器语法</p>
-                        <p>支持 pcap/pcapng 格式</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    return HTMLResponse(html_content)
-
-async def root_redirect(request: Request):
-    """将根路径重定向到状态页面"""
-    return RedirectResponse(url="/status")
+    logger.info("正在关闭服务器...")
+    cleanup()
+    os._exit(0)
 
 def get_system_info() -> Dict[str, str]:
     """获取系统信息"""
@@ -889,8 +840,6 @@ def print_banner(system_info: Dict[str, str]):
     print(banner)
 
 def main():
-    global server_instance
-    
     parser = argparse.ArgumentParser(description="Wireshark MCP 服务器")
     parser.add_argument("--tshark-path",
                        default="tshark",
@@ -902,6 +851,10 @@ def main():
                        type=int,
                        default=3000,
                        help="服务器端口")
+    parser.add_argument("--transport",
+                       choices=["sse", "stdio", "streamable-http"],
+                       default="sse",
+                       help="MCP 传输协议")
     args = parser.parse_args()
     
     # 获取系统信息并打印横幅
@@ -916,39 +869,26 @@ def main():
         wireshark = WiresharkMCP(args.tshark_path)
         mcp = create_mcp_server(wireshark)
         
-        # 配置中间件
-        middleware = [
-            Middleware(CORSMiddleware,
-                      allow_origins=["*"],
-                      allow_methods=["*"],
-                      allow_headers=["*"])
-        ]
+        logger.info(f"启动 Wireshark MCP 服务器")
+        logger.info(f"传输协议: {args.transport}")
+        logger.info(f"服务器地址: {args.host}:{args.port}")
         
-        # 创建 Starlette 应用并配置路由
-        routes = [
-            Route("/status", homepage),
-            Mount("/", app=mcp.sse_app())
-        ]
+        if args.transport == "sse":
+            logger.info(f"SSE 端点: http://{args.host}:{args.port}/sse")
+            logger.info(f"状态页面: http://{args.host}:{args.port}/")
+            mcp.run()
+        elif args.transport == "stdio":
+            logger.info("使用 stdio 传输")
+            import asyncio
+            asyncio.run(mcp.run_stdio_async())
+        elif args.transport == "streamable-http":
+            logger.info(f"HTTP 端点: http://{args.host}:{args.port}/mcp")
+            import asyncio
+            asyncio.run(mcp.run_streamable_http_async())
         
-        app = Starlette(
-            routes=routes,
-            middleware=middleware
-        )
-        
-        logger.info(f"服务器地址: http://{args.host}:{args.port}")
-        logger.info(f"状态页面: http://{args.host}:{args.port}/status")
-        logger.info(f"SSE 端点: http://{args.host}:{args.port}/")
-        
-        # 配置 uvicorn 服务器
-        config = uvicorn.Config(
-            app,
-            host=args.host,
-            port=args.port,
-            log_level="info"
-        )
-        server_instance = uvicorn.Server(config)
-        server_instance.run()
-        
+    except KeyboardInterrupt:
+        logger.info("收到中断信号，正在关闭服务器...")
+        cleanup()
     except Exception as e:
         logger.error(f"服务器启动失败: {e}")
         cleanup()

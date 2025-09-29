@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "wireshark": {
+      "command": "python",
+      "args": ["/path/to/wireshark_mcp.py", "--transport", "stdio"],
+      "description": "Wireshark network packet analysis server",
+      "env": {
+        "PATH": "/usr/local/bin:/usr/bin:/bin"
+      }
+    }
+  }
+}
